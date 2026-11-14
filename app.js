@@ -2,13 +2,51 @@
 const $=id=>document.getElementById(id);
 const STORAGE='famosos_lista_v3';
 const API='https://famosos-api.comercial-ddd.workers.dev';
-const ALIASES={'the rock':'Dwayne Johnson','dwayne the rock johnson':'Dwayne Johnson','dwayne johnson':'Dwayne Johnson'};
-function samePerson(a,b){const x=norm(a),y=norm(b);return x===y||(ALIASES[x]&&norm(ALIASES[x])===y)||(ALIASES[y]&&norm(ALIASES[y])===x)||(ALIASES[x]&&ALIASES[y]&&ALIASES[x]===ALIASES[y]);}
+// Os apelidos são persistidos separadamente da lista para manter o formato nome e foto.
+const KNOWN_ALIASES={
+  'the rock':'Dwayne Johnson',
+  'dwayne the rock johnson':'Dwayne Johnson',
+  'dwayne johnson':'Dwayne Johnson',
+  'robert downey junior':'Robert Downey Jr.',
+  'rdj':'Robert Downey Jr.',
+  'j lo':'Jennifer Lopez',
+  'jlo':'Jennifer Lopez',
+  'king of pop':'Michael Jackson'
+};
+const ALIAS_KEY='famosos_apelidos_v1';
+const PHOTO_OPTIONS_KEY='famosos_opcoes_fotos_v1';
+const norm=s=>String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+function readObject(key){try{const x=JSON.parse(localStorage.getItem(key)||'{}');return x&&typeof x==='object'&&!Array.isArray(x)?x:{};}catch{return {};}}
+const rememberedAliases=readObject(ALIAS_KEY);
+const photoOptions=readObject(PHOTO_OPTIONS_KEY);
+function canonical(name){
+  let key=norm(name);
+  for(let n=0;n<4;n++){
+    const next=rememberedAliases[key]||KNOWN_ALIASES[key];
+    if(!next||norm(next)===key)break;
+    key=norm(next);
+  }
+  return key;
+}
+function samePerson(a,b){return !!norm(a)&&!!norm(b)&&canonical(a)===canonical(b);}
+function findPerson(name){return people.find(p=>samePerson(p.name,name));}
+function rememberIdentity(input,person,ai){
+  if(!person)return;
+  const target=person.name;
+  for(const word of [input,ai?.nome,ai?.nome_canonico]){
+    if(word&&norm(word)!==norm(target))rememberedAliases[norm(word)]=target;
+  }
+  try{localStorage.setItem(ALIAS_KEY,JSON.stringify(rememberedAliases));}catch{}
+}
+function cacheOptions(name,found){
+  if(!found?.length)return;
+  photoOptions[canonical(name)]=[...new Set(found)].slice(0,30);
+  try{localStorage.setItem(PHOTO_OPTIONS_KEY,JSON.stringify(photoOptions));}catch{}
+}
 async function askGemini(name){const r=await fetch(API+'?nome='+encodeURIComponent(name));if(!r.ok)throw Error('A IA não respondeu');const d=await r.json();if(d.erro)throw Error(d.erro);return d;}
 let people=loadPeople(), selection=null, candidates=[], photoIndex=0, currentUpload=null;
 let abortExport=false, exportBusy=false;
 const urls=new Map(), loading=new Set();
-const norm=s=>s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
 function loadPeople(){try{const a=JSON.parse(localStorage.getItem(STORAGE)||localStorage.getItem('famosos_lista_v2'));if(Array.isArray(a))return a.filter(p=>p&&typeof p.name==='string').map(p=>({name:p.name,url:p.url||'',source:p.source||'',locked:!!p.locked}));}catch{}return SEED_NAMES.map(name=>({name,url:'',source:'',locked:false}));}
 function persist(){try{localStorage.setItem(STORAGE,JSON.stringify(people));}catch(e){announce('Espaço insuficiente para salvar alterações neste navegador.');}}
 function announce(s){$('status').textContent=s;}
@@ -20,19 +58,36 @@ async function dbDel(key){try{const db=await openDB();await new Promise((res,rej
 async function getPhotoBlob(p){const existing=await dbGet(p.name);if(existing)return existing;if(!p.url||p.url.startsWith('local:'))return null;try{const r=await fetch(p.url,{mode:'cors'});if(!r.ok)throw Error('foto indisponível');const blob=await r.blob();if(!blob.type.startsWith('image/'))return null;await dbPut(p.name,blob);return blob;}catch{return null;}}
 async function getViewUrl(p){const blob=await dbGet(p.name);if(blob){if(!urls.has(p.name))urls.set(p.name,URL.createObjectURL(blob));return urls.get(p.name);}return p.url&&!p.url.startsWith('local:')?p.url:'';}
 function clearObjUrl(name){if(urls.has(name)){URL.revokeObjectURL(urls.get(name));urls.delete(name);}}
-function render(){updateSearchButton();const term=norm($('search').value), shown=people.filter(p=>norm(p.name).includes(term));$('count').textContent=`${people.length} nomes, ${shown.length} exibidos`;$('grid').replaceChildren();if(!shown.length){const d=document.createElement('div');d.className='empty';d.textContent='Nome não encontrado. Use Adicionar para pesquisar e incluir.';$('grid').append(d);return;}
+function render(){updateSearchButton();const term=norm($('search').value), canonicalTerm=canonical(term), shown=people.filter(p=>norm(p.name).includes(term)||(term&&canonical(p.name)===canonicalTerm));$('count').textContent=`${people.length} nomes, ${shown.length} exibidos`;$('grid').replaceChildren();if(!shown.length){const d=document.createElement('div');d.className='empty';d.textContent='Nome não encontrado. Use Adicionar para identificar e incluir.';$('grid').append(d);return;}
 const frag=document.createDocumentFragment();for(const p of shown){const card=document.createElement('article');card.className='person';const portrait=document.createElement('div');portrait.className='portrait';portrait.textContent='◯';portrait.dataset.person=p.name;const body=document.createElement('div');body.className='personbody';const name=document.createElement('div');name.className='name';name.textContent=p.name;const acts=document.createElement('div');acts.className='actions';const btn=document.createElement('button');btn.className='btn small';btn.textContent='Trocar foto';btn.onclick=()=>editPhoto(p);acts.append(btn);body.append(name,acts);const del=document.createElement('button');del.className='del';del.textContent='×';del.title='Excluir da lista';del.setAttribute('aria-label',`Excluir ${p.name}`);del.onclick=async()=>{if(!confirm(`Excluir ${p.name} da lista?`))return;people=people.filter(x=>x!==p);clearObjUrl(p.name);await dbDel(p.name);persist();render();};card.append(portrait,body,del);frag.append(card);} $('grid').append(frag);observePortraits();}
 let observer;
 function observePortraits(){if(observer)observer.disconnect();observer=new IntersectionObserver(entries=>{for(const e of entries){if(e.isIntersecting){observer.unobserve(e.target);fillPortrait(e.target);}}},{rootMargin:'500px'});document.querySelectorAll('.portrait').forEach(el=>observer.observe(el));}
 async function fillPortrait(el){const name=el.dataset.person,p=people.find(x=>x.name===name);if(!p||!el.isConnected)return;let src=await getViewUrl(p);if(!src&&!p.locked&&!loading.has(name)){loading.add(name);try{const found=await wikiPortrait(name);if(found){p.url=found;p.source='Wikipédia';persist();src=found;}}catch{}finally{loading.delete(name);}}if(!el.isConnected||!src)return;const img=document.createElement('img');img.loading='lazy';img.alt=name;img.src=src;img.onerror=()=>{img.remove();el.textContent='◯';};el.replaceChildren(img);}
 async function wikiPortrait(name){for(const domain of ['pt.wikipedia.org','en.wikipedia.org']){try{const u=`https://${domain}/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(name)}&gsrlimit=5&prop=pageimages&pithumbsize=640&format=json&origin=*`;const r=await fetch(u);if(!r.ok)continue;const data=await r.json();const pages=Object.values(data.query?.pages||{}).sort((a,b)=>(a.index||99)-(b.index||99));const exact=pages.find(p=>norm(p.title)===norm(name)&&p.thumbnail);const choice=exact||pages.find(p=>p.thumbnail&&norm(p.title).includes(norm(name)));if(choice)return choice.thumbnail.source;}catch{}}return '';
 }
-async function findCandidates(name){const seen=new Set(),out=[];const add=(u)=>{if(u&&/^https:\/\//.test(u)&&!seen.has(u)){seen.add(u);out.push(u);}};try{const ai=await askGemini(name);for(const u of ai.fotos||[])add(u);}catch(e){console.warn('Busca inteligente indisponível:',e.message);}if(out.length)return out;const preferred=await wikiPortrait(name);add(preferred);
-for(const domain of ['commons.wikimedia.org']){try{const query=`${name} portrait`;const endpoint=`https://${domain}/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=25&prop=imageinfo&iiprop=url|mime&iiurlwidth=900&format=json&origin=*`;const resp=await fetch(endpoint);const d=await resp.json();const pages=Object.values(d.query?.pages||{}).sort((a,b)=>(a.index||100)-(b.index||100));for(const p of pages){const item=p.imageinfo?.[0];if(item?.mime?.startsWith('image/')&&!item.mime.includes('svg'))add(item.thumburl||item.url);}}catch{}}
-return out;}
+async function findCandidates(name, skipAI=true){
+  const seen=new Set(),out=[];
+  const add=u=>{if(u&&typeof u==='string'&&u.startsWith('https:')&&!seen.has(u)){seen.add(u);out.push(u);}};
+  // Buscar novamente uma foto não deve gastar uma consulta no Gemini.
+  for(const u of photoOptions[canonical(name)]||[])add(u);
+  const preferred=await wikiPortrait(name);
+  add(preferred);
+  try{
+    const endpoint=new URL('https://commons.wikimedia.org/w/api.php');
+    endpoint.search=new URLSearchParams({action:'query',generator:'search',gsrsearch:`filetype:bitmap ${name} portrait`,gsrnamespace:'6',gsrlimit:'25',prop:'imageinfo',iiprop:'url|mime',iiurlwidth:'900',format:'json',origin:'*'}).toString();
+    const resp=await fetch(endpoint.toString());
+    if(resp.ok){
+      const d=await resp.json();
+      const pages=Object.values(d.query?.pages||{}).sort((a,b)=>(a.index||100)-(b.index||100));
+      for(const p of pages){const info=p.imageinfo?.[0];if(info?.mime?.startsWith('image/')&&!info.mime.includes('svg'))add(info.thumburl||info.url);}
+    }
+  }catch(e){console.warn('Pesquisa Commons indisponível:',e);}
+  cacheOptions(name,out);
+  return out;
+}
 function dlgInfo(text){$('dlgStatus').textContent=text;}
 function displaySelection(){const img=candidates[photoIndex];$('dlgPreview').replaceChildren();if(img){const el=document.createElement('img');el.src=img;el.alt=selection?.name||'Foto';el.onerror=()=>dlgInfo('Esta imagem não abriu. Toque em Outra foto.');$('dlgPreview').append(el);dlgInfo(`Foto ${photoIndex+1} de ${candidates.length}. Você pode escolher outra.`);}else{$('dlgPreview').textContent='Sem foto';dlgInfo('Não encontramos fotos automaticamente. Você pode escolher uma imagem do aparelho.');}$('prevPhoto').disabled=photoIndex<=0;$('nextPhoto').disabled=photoIndex>=candidates.length-1;$('dlgSave').disabled=!img&&!currentUpload;}
-async function editPhoto(p){selection=p;currentUpload=null;candidates=[];photoIndex=0;$('dlgName').textContent=p.name;$('dialogBg').classList.add('open');$('dlgPreview').textContent='Pesquisando...';dlgInfo('Buscando fotos na Wikipédia e no Wikimedia Commons...');$('dlgSave').disabled=true;$('photoUpload').value='';try{const found=await findCandidates(p.name);if(selection!==p)return;candidates=found;if(p.url&&!p.url.startsWith('local:')){const i=candidates.indexOf(p.url);if(i>=0)photoIndex=i;else{candidates.unshift(p.url);photoIndex=0;}}displaySelection();}catch{displaySelection();}}
+async function editPhoto(p,prefetched=[]){selection=p;currentUpload=null;candidates=[];photoIndex=0;$('dlgName').textContent=p.name;$('dialogBg').classList.add('open');$('dlgPreview').textContent='Pesquisando...';dlgInfo('Buscando fotos na Wikipédia e no Wikimedia Commons...');$('dlgSave').disabled=true;$('photoUpload').value='';try{const found=prefetched.length?prefetched:await findCandidates(p.name);if(selection!==p)return;candidates=found;cacheOptions(p.name,candidates);if(p.url&&!p.url.startsWith('local:')){const i=candidates.indexOf(p.url);if(i>=0)photoIndex=i;else{candidates.unshift(p.url);photoIndex=0;}}displaySelection();}catch{displaySelection();}}
 function closeDialog(){$('dialogBg').classList.remove('open');selection=null;currentUpload=null;}
 $('prevPhoto').onclick=()=>{if(photoIndex>0){photoIndex--;currentUpload=null;displaySelection();}};
 $('nextPhoto').onclick=()=>{if(photoIndex<candidates.length-1){photoIndex++;currentUpload=null;displaySelection();}};
@@ -41,10 +96,50 @@ $('photoUpload').onchange=async e=>{const f=e.target.files?.[0];if(!f||!f.type.s
 $('dlgSave').onclick=async()=>{if(!selection)return;const p=selection,blob=currentUpload,url=currentUpload?'local:foto':candidates[photoIndex];if(!blob&&!url)return;$('dlgSave').disabled=true;try{if(blob){await dbPut(p.name,blob);}else{const response=await fetch(url,{mode:'cors'});if(response.ok){const b=await response.blob();if(b.type.startsWith('image/'))await dbPut(p.name,b);}}p.url=url;p.locked=true;p.source=blob?'Arquivo do aparelho':'Wikimedia';clearObjUrl(p.name);persist();closeDialog();render();announce(`Foto de ${p.name} salva.`);}catch(e){dlgInfo('Não foi possível guardar essa foto. Tente outra ou escolha do aparelho.');$('dlgSave').disabled=false;}};
 $('search').addEventListener('input',render);
 $('resetFilter').onclick=()=>{$('search').value='';render();};
-function updateSearchButton(){const term=$('search').value.trim();const exists=people.some(p=>samePerson(p.name,term));$('add').textContent=exists||!term?'⌕':'＋ Adicionar';$('add').title=exists?'Buscar e trocar foto':'Adicionar novo famoso';}
-$('add').onclick=async()=>{const name=$('search').value.trim().replace(/\s+/g,' ');if(!name){$('search').focus();return;}let p=people.find(p=>samePerson(p.name,name));if(p){await editPhoto(p);return;}$('add').disabled=true;let ai=null;try{announce('Identificando o famoso com o Gemini...');ai=await askGemini(name);}catch(e){announce('IA indisponível. A pesquisa de fotos continuará sem ela.');}finally{$('add').disabled=false;}
-if(ai){p=people.find(p=>samePerson(p.name,ai.nome_canonico||'')||samePerson(p.name,ai.nome||''));if(p){$('search').value=p.name;render();await editPhoto(p);return;}}
-p={name,url:'',source:'',locked:false};people.push(p);persist();render();announce(`${name} adicionado à lista. Escolha a foto.`);editPhoto(p);};
+function updateSearchButton(){
+  const term=$('search').value.trim();
+  const exists=findPerson(term);
+  $('add').textContent=exists||!term?'⌕':'＋ Adicionar';
+  $('add').title=exists?'Ver e trocar foto':'Pesquisar e adicionar famoso';
+}
+$('add').onclick=async()=>{
+  const name=$('search').value.trim().replace(/\s+/g,' ');
+  if(!name){$('search').focus();return;}
+  let p=findPerson(name);
+  if(p){
+    $('search').value=p.name;
+    render();
+    await editPhoto(p);
+    return;
+  }
+  $('add').disabled=true;
+  let ai=null;
+  try{
+    announce('Identificando o famoso com o Gemini...');
+    ai=await askGemini(name);
+  }catch(e){announce('IA indisponível. Você ainda pode incluir o nome e escolher uma foto.');}
+  finally{$('add').disabled=false;}
+  p=findPerson(ai?.nome_canonico)||findPerson(ai?.nome)||findPerson(name);
+  if(p){
+    rememberIdentity(name,p,ai);
+    if(ai?.fotos?.length)cacheOptions(p.name,ai.fotos);
+    $('search').value=p.name;
+    render();
+    announce(`${p.name} já está na lista. Nenhum nome foi duplicado.`);
+    await editPhoto(p,ai?.fotos||[]);
+    return;
+  }
+  const displayName=ai?.nome||name;
+  p={name:displayName,url:'',source:'',locked:false};
+  people.push(p);
+  rememberIdentity(name,p,ai);
+  if(ai?.fotos?.length)cacheOptions(p.name,ai.fotos);
+  persist();
+  $('search').value=p.name;
+  render();
+  announce(`${p.name} incluído na lista. Escolha e salve uma foto.`);
+  await editPhoto(p,ai?.fotos||[]);
+};
 $('search').addEventListener('keydown',e=>{if(e.key==='Enter')$('add').click();});
 $('dialogBg').onclick=e=>{if(e.target===$('dialogBg'))closeDialog();};
 $('progCancel').onclick=()=>{abortExport=true;};
