@@ -1,7 +1,7 @@
 /* Famosos: Web App independente, sem contas nem serviços pagos. */
 const $=id=>document.getElementById(id);
 const STORAGE='famosos_lista_v3';
-const API='https://famosos-api.comercial-ddd.workers.dev';
+// Pesquisa gratuita na Wikipédia e no Wikimedia Commons, sem Gemini.
 // Os apelidos são persistidos separadamente da lista para manter o formato nome e foto.
 const KNOWN_ALIASES={
   'the rock':'Dwayne Johnson',
@@ -43,7 +43,6 @@ function cacheOptions(name,found){
   photoOptions[canonical(name)]=[...new Set(found)].slice(0,30);
   try{localStorage.setItem(PHOTO_OPTIONS_KEY,JSON.stringify(photoOptions));}catch{}
 }
-async function askGemini(name){const r=await fetch(API+'?nome='+encodeURIComponent(name));if(!r.ok)throw Error('A IA não respondeu');const d=await r.json();if(d.erro)throw Error(d.erro);return d;}
 let people=loadPeople(), selection=null, candidates=[], photoIndex=0, currentUpload=null;
 let abortExport=false, exportBusy=false;
 const urls=new Map(), loading=new Set();
@@ -63,6 +62,12 @@ const frag=document.createDocumentFragment();for(const p of shown){const card=do
 let observer;
 function observePortraits(){if(observer)observer.disconnect();observer=new IntersectionObserver(entries=>{for(const e of entries){if(e.isIntersecting){observer.unobserve(e.target);fillPortrait(e.target);}}},{rootMargin:'500px'});document.querySelectorAll('.portrait').forEach(el=>observer.observe(el));}
 async function fillPortrait(el){const name=el.dataset.person,p=people.find(x=>x.name===name);if(!p||!el.isConnected)return;let src=await getViewUrl(p);if(!src&&!p.locked&&!loading.has(name)){loading.add(name);try{const found=await wikiPortrait(name);if(found){p.url=found;p.source='Wikipédia';persist();src=found;}}catch{}finally{loading.delete(name);}}if(!el.isConnected||!src)return;const img=document.createElement('img');img.loading='lazy';img.alt=name;img.src=src;img.onerror=()=>{img.remove();el.textContent='◯';};el.replaceChildren(img);}
+async function searchWikipediaPerson(name){
+ const u=new URL('https://pt.wikipedia.org/w/api.php');
+ u.search=new URLSearchParams({action:'query',list:'search',srsearch:`${name} (cantor OR cantora OR ator OR atriz OR músico OR atriz OR apresentador)`,srlimit:'6',format:'json',origin:'*'}).toString();
+ const r=await fetch(u.toString());if(!r.ok)return [];
+ const j=await r.json();return (j.query?.search||[]).filter(p=>!BLOCKED_IMAGE.test(p.title));
+}
 async function wikiPortrait(name){for(const domain of ['pt.wikipedia.org','en.wikipedia.org']){try{const u=`https://${domain}/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(name)}&gsrlimit=5&prop=pageimages&pithumbsize=640&format=json&origin=*`;const r=await fetch(u);if(!r.ok)continue;const data=await r.json();const pages=Object.values(data.query?.pages||{}).sort((a,b)=>(a.index||99)-(b.index||99));const exact=pages.find(p=>norm(p.title)===norm(name)&&p.thumbnail);const choice=exact||pages.find(p=>p.thumbnail&&norm(p.title).includes(norm(name)));if(choice)return choice.thumbnail.source;}catch{}}return '';
 }
 async function findCandidates(name, skipAI=true){
@@ -156,59 +161,105 @@ async function commonsHeadshots(name){
  found.sort((a,b)=>b.score-a.score);
  return found;
 }
+// Análise de rosto executada localmente. Nenhuma foto é enviada para serviços de IA.
+let faceToolsPromise;
+function faceTools(){
+  if(!faceToolsPromise)faceToolsPromise=import('./face.js').then(m=>m.getFaceTools()).catch(e=>{faceToolsPromise=null;throw e;});
+  return faceToolsPromise;
+}
+const analyzedPhotos=new Map();
+async function evaluatePortrait(url, tools){
+  if(analyzedPhotos.has(url))return analyzedPhotos.get(url);
+  const outcome=await tools.processUrl(url).catch(()=>null);
+  // cache no máximo alguns resultados em memória
+  analyzedPhotos.set(url,outcome);
+  if(analyzedPhotos.size>100){const key=analyzedPhotos.keys().next().value;analyzedPhotos.delete(key);}
+  return outcome;
+}
+async function rankedFacePortraits(name, onStep){
+  const wiki=await wikiPortrait(name);
+  const commons=await commonsHeadshots(name);
+  const raw=[...new Set([wiki,...commons.map(x=>x.url)].filter(Boolean))].slice(0,12);
+  if(!raw.length)return [];
+  const tools=await faceTools();
+  const ranked=[];
+  for(let i=0;i<raw.length;i++){
+    if(batchCancelled)break;
+    onStep?.(i+1,raw.length);
+    const result=await evaluatePortrait(raw[i],tools);
+    if(!result)continue;
+    // Pequeno bônus para imagem associada à página biográfica exata.
+    const bonus=raw[i]===wiki?8:0;
+    ranked.push({...result,url:raw[i],score:result.score+bonus});
+  }
+  ranked.sort((a,b)=>b.score-a.score);
+  return ranked;
+}
 async function bestPortrait(name){
- // For one-word names, prefer verified Wikipedia profile when Commons is ambiguous.
- const listed=await commonsHeadshots(name);
- if(listed.length && listed[0].score>=30)return listed[0].url;
- const wiki=await wikiPortrait(name);
- if(wiki)return wiki;
- return listed.length && listed[0].score>=15?listed[0].url:'';
+  const ranked=await rankedFacePortraits(name);
+  return ranked[0]&&ranked[0].score>=35?ranked[0]:null;
 }
 let batchRunning=false, batchCancelled=false;
 function sleep(ms){return new Promise(ok=>setTimeout(ok,ms));}
 async function refreshEntireList(){
  if(batchRunning||exportBusy)return;
- const overwrite=confirm('Vamos procurar retratos para todos os nomes. Fotos escolhidas manualmente serão preservadas. Deseja também substituir suas fotos escolhidas manualmente?\n\nOK: substituir todas as fotos.\nCancelar: preservar fotos manuais e continuar.');
- if(!confirm('Antes de começar, recomendamos usar Cópia da lista para guardar seus nomes. Iniciar a revisão de '+people.length+' famosos agora?'))return;
+ const overwrite=confirm('Deseja substituir também as fotos que você escolheu manualmente?\n\nOK: incluir fotos manuais.\nCancelar: manter as fotos manuais e revisar as demais.');
+ if(!confirm('Antes de continuar, faça uma Cópia da lista. Revisar '+people.length+' nomes buscando fotos com rosto em destaque? Isso pode consumir bastante internet e tempo.'))return;
  batchRunning=true;batchCancelled=false;
  $('refreshAll').disabled=true;
- const group=[...people];let updated=0,skipped=0,failed=0;
- $('progCancel').textContent='Cancelar revisão';
- for(let i=0;i<group.length;i++){
-   if(batchCancelled)break;
-   const p=group[i];
-   progress('Revisando fotos da lista',100*i/group.length,`${i+1} de ${group.length}, ${p.name}. Atualizadas: ${updated}`);
-   if(p.locked&&!overwrite){skipped++;continue;}
-   try{
-     const url=await bestPortrait(p.name);
-     if(!url){failed++;continue;}
-     // Store each image before overwriting a previous saved choice.
-     let blob=null;
-     try{const r=await fetch(url,{mode:'cors',signal:AbortSignal.timeout(16000)});if(r.ok){const b=await r.blob();if(b.type.startsWith('image/')&&b.size>3000)blob=b;}}catch{}
-     if(!blob){failed++;continue;}
-     const current=people.find(x=>x.name===p.name);
-     if(!current){skipped++;continue;}
-     await dbPut(p.name,blob);
-     current.url=url;current.source='Retrato pesquisado';current.locked=false;
-     clearObjUrl(p.name);updated++;persist();
-   }catch(e){failed++;}
-   if(i%5===0)await sleep(100);
- }
- batchRunning=false;$('refreshAll').disabled=false;
- endProgress();
- $('progCancel').textContent='Cancelar';
- render();announce(`${batchCancelled?'Revisão interrompida.':'Revisão concluída.'} ${updated} fotos atualizadas, ${skipped} preservadas, ${failed} não encontradas. Fotos sem resultado foram mantidas.`);
+ let updated=0,skipped=0,failed=0;
+ const group=[...people];
+ try{
+   await faceTools();
+   for(let i=0;i<group.length;i++){
+     if(batchCancelled)break;
+     const p=group[i];
+     progress('Analisando rostos',(100*i)/group.length,`${i+1} de ${group.length}, ${p.name}. Atualizadas: ${updated}`);
+     if(p.locked&&!overwrite){skipped++;continue;}
+     try{
+       const best=await bestPortrait(p.name);
+       if(!best||batchCancelled){failed++;continue;}
+       const current=people.find(x=>x.name===p.name);
+       if(!current){skipped++;continue;}
+       await dbPut(p.name,best.blob);
+       current.url=best.url;
+       current.source='Retrato recortado';current.locked=false;
+       clearObjUrl(p.name);updated++;persist();
+     }catch(e){failed++;}
+     if(i%3===0)await sleep(80);
+   }
+   announce(`${batchCancelled?'Revisão cancelada.':'Revisão concluída.'} ${updated} fotos atualizadas, ${skipped} preservadas, ${failed} sem retrato adequado. Fotos não encontradas foram mantidas.`);
+ }catch(e){announce('Não foi possível inicializar a detecção de rostos. Confira a conexão com a internet e tente novamente.');}
+ finally{batchRunning=false;$('refreshAll').disabled=false;endProgress();render();}
 }
 $('refreshAll').onclick=refreshEntireList;
 function dlgInfo(text){$('dlgStatus').textContent=text;}
-function displaySelection(){const img=candidates[photoIndex];$('dlgPreview').replaceChildren();if(img){const el=document.createElement('img');el.src=img;el.alt=selection?.name||'Foto';el.onerror=()=>dlgInfo('Esta imagem não abriu. Toque em Outra foto.');$('dlgPreview').append(el);dlgInfo(`Foto ${photoIndex+1} de ${candidates.length}. Você pode escolher outra.`);}else{$('dlgPreview').textContent='Sem foto';dlgInfo('Não encontramos fotos automaticamente. Você pode escolher uma imagem do aparelho.');}$('prevPhoto').disabled=photoIndex<=0;$('nextPhoto').disabled=photoIndex>=candidates.length-1;$('dlgSave').disabled=!img&&!currentUpload;}
-async function editPhoto(p,prefetched=[]){selection=p;currentUpload=null;candidates=[];photoIndex=0;$('dlgName').textContent=p.name;$('dialogBg').classList.add('open');$('dlgPreview').textContent='Pesquisando...';dlgInfo('Buscando fotos na Wikipédia e no Wikimedia Commons...');$('dlgSave').disabled=true;$('photoUpload').value='';try{const found=prefetched.length?prefetched:await findCandidates(p.name);if(selection!==p)return;candidates=found;cacheOptions(p.name,candidates);if(p.url&&!p.url.startsWith('local:')){const i=candidates.indexOf(p.url);if(i>=0)photoIndex=i;else{candidates.unshift(p.url);photoIndex=0;}}displaySelection();}catch{displaySelection();}}
+function displaySelection(){const img=candidates[photoIndex];$('dlgPreview').replaceChildren();if(img){const el=document.createElement('img');el.src=img;el.alt=selection?.name||'Foto';if(curatedBlobByUrl.has(img)){const object=URL.createObjectURL(curatedBlobByUrl.get(img));el.src=object;el.onload=()=>URL.revokeObjectURL(object);}el.onerror=()=>dlgInfo('Esta imagem não abriu. Toque em Outra foto.');$('dlgPreview').append(el);dlgInfo(`Retrato ${photoIndex+1} de ${candidates.length}, rosto analisado e recorte pronto para salvar.`);}else{$('dlgPreview').textContent='Sem foto';dlgInfo('Não encontramos fotos automaticamente. Você pode escolher uma imagem do aparelho.');}$('prevPhoto').disabled=photoIndex<=0;$('nextPhoto').disabled=photoIndex>=candidates.length-1;$('dlgSave').disabled=!img&&!currentUpload;}
+let curatedBlobByUrl=new Map();
+async function editPhoto(p){
+ batchCancelled=false;selection=p;currentUpload=null;candidates=[];photoIndex=0;
+ $('dlgName').textContent=p.name;$('dialogBg').classList.add('open');
+ $('dlgPreview').textContent='Pesquisando...';
+ dlgInfo('Analisando rostos e escolhendo retratos. A primeira análise requer internet.');
+ $('dlgSave').disabled=true;$('photoUpload').value='';curatedBlobByUrl.clear();
+ try{
+   const results=await rankedFacePortraits(p.name,(done,total)=>{if(selection===p)dlgInfo(`Analisando rosto ${done} de ${total}...`);});
+   if(selection!==p)return;
+   for(const r of results){curatedBlobByUrl.set(r.url,r.blob);candidates.push(r.url);}
+   if(!candidates.length){dlgInfo('Não encontramos retratos com rosto detectável. Você pode escolher uma foto do aparelho.');}
+   displaySelection();
+ }catch(e){
+   if(selection!==p)return;
+   displaySelection();
+   dlgInfo('Não foi possível analisar os rostos. Verifique a conexão ou escolha uma foto do aparelho.');
+ }
+}
 function closeDialog(){$('dialogBg').classList.remove('open');selection=null;currentUpload=null;}
 $('prevPhoto').onclick=()=>{if(photoIndex>0){photoIndex--;currentUpload=null;displaySelection();}};
 $('nextPhoto').onclick=()=>{if(photoIndex<candidates.length-1){photoIndex++;currentUpload=null;displaySelection();}};
 $('dlgCancel').onclick=closeDialog;
 $('photoUpload').onchange=async e=>{const f=e.target.files?.[0];if(!f||!f.type.startsWith('image/'))return;currentUpload=f;const tmp=URL.createObjectURL(f);$('dlgPreview').replaceChildren();const i=document.createElement('img');i.src=tmp;i.onload=()=>URL.revokeObjectURL(tmp);$('dlgPreview').append(i);dlgInfo('Imagem selecionada no aparelho. Toque em Salvar foto.');$('dlgSave').disabled=false;};
-$('dlgSave').onclick=async()=>{if(!selection)return;const p=selection,blob=currentUpload,url=currentUpload?'local:foto':candidates[photoIndex];if(!blob&&!url)return;$('dlgSave').disabled=true;try{if(blob){await dbPut(p.name,blob);}else{const response=await fetch(url,{mode:'cors'});if(response.ok){const b=await response.blob();if(b.type.startsWith('image/'))await dbPut(p.name,b);}}p.url=url;p.locked=true;p.source=blob?'Arquivo do aparelho':'Wikimedia';clearObjUrl(p.name);persist();closeDialog();render();announce(`Foto de ${p.name} salva.`);}catch(e){dlgInfo('Não foi possível guardar essa foto. Tente outra ou escolha do aparelho.');$('dlgSave').disabled=false;}};
+$('dlgSave').onclick=async()=>{if(!selection)return;const p=selection,blob=currentUpload,url=currentUpload?'local:foto':candidates[photoIndex];if(!blob&&!url)return;$('dlgSave').disabled=true;try{if(blob){await dbPut(p.name,blob);}else if(curatedBlobByUrl.has(url)){await dbPut(p.name,curatedBlobByUrl.get(url));}else{throw Error('Foto ainda não analisada');}p.url=url;p.locked=true;p.source=blob?'Arquivo do aparelho':'Wikimedia';clearObjUrl(p.name);persist();closeDialog();render();announce(`Foto de ${p.name} salva.`);}catch(e){dlgInfo('Não foi possível guardar essa foto. Tente outra ou escolha do aparelho.');$('dlgSave').disabled=false;}};
 $('search').addEventListener('input',render);
 $('resetFilter').onclick=()=>{$('search').value='';render();};
 function updateSearchButton(){
@@ -218,42 +269,31 @@ function updateSearchButton(){
   $('add').title=exists?'Ver e trocar foto':'Pesquisar e adicionar famoso';
 }
 $('add').onclick=async()=>{
-  const name=$('search').value.trim().replace(/\s+/g,' ');
-  if(!name){$('search').focus();return;}
-  let p=findPerson(name);
-  if(p){
-    $('search').value=p.name;
-    render();
-    await editPhoto(p);
-    return;
-  }
-  $('add').disabled=true;
-  let ai=null;
-  try{
-    announce('Identificando o famoso com o Gemini...');
-    ai=await askGemini(name);
-  }catch(e){announce('IA indisponível. Você ainda pode incluir o nome e escolher uma foto.');}
-  finally{$('add').disabled=false;}
-  p=findPerson(ai?.nome_canonico)||findPerson(ai?.nome)||findPerson(name);
-  if(p){
-    rememberIdentity(name,p,ai);
-    if(ai?.fotos?.length)cacheOptions(p.name,ai.fotos);
-    $('search').value=p.name;
-    render();
-    announce(`${p.name} já está na lista. Nenhum nome foi duplicado.`);
-    await editPhoto(p,ai?.fotos||[]);
-    return;
-  }
-  const displayName=ai?.nome||name;
-  p={name:displayName,url:'',source:'',locked:false};
-  people.push(p);
-  rememberIdentity(name,p,ai);
-  if(ai?.fotos?.length)cacheOptions(p.name,ai.fotos);
-  persist();
-  $('search').value=p.name;
-  render();
-  announce(`${p.name} incluído na lista. Escolha e salve uma foto.`);
-  await editPhoto(p,ai?.fotos||[]);
+ const name=$('search').value.trim().replace(/\s+/g,' ');
+ if(!name){$('search').focus();return;}
+ let p=findPerson(name);
+ if(p){$('search').value=p.name;render();await editPhoto(p);return;}
+ // A identificação exata é procurada na Wikipédia, sem usar Gemini.
+ // Nomes ambíguos podem precisar de confirmação manual pelo usuário.
+ $('add').disabled=true;announce('Verificando o nome na Wikipédia...');
+ let chosen=name;
+ try{
+   const matches=await searchWikipediaPerson(name);
+   if(matches.length){
+     const best=matches[0];
+     if(norm(best.title)!==norm(name)){
+       if(confirm(`Encontramos "${best.title}" na Wikipédia. Quer usar este nome na lista?`))chosen=best.title;
+     }
+   }
+ }catch{}
+ finally{$('add').disabled=false;}
+ p=findPerson(chosen)||findPerson(name);
+ if(p){rememberIdentity(name,p,{nome_canonico:chosen});$('search').value=p.name;render();await editPhoto(p);return;}
+ p={name:chosen,url:'',source:'',locked:false};people.push(p);
+ rememberIdentity(name,p,{nome_canonico:chosen});persist();
+ $('search').value=p.name;render();
+ announce(`${p.name} incluído. Escolha e salve um retrato.`);
+ await editPhoto(p);
 };
 $('search').addEventListener('keydown',e=>{if(e.key==='Enter')$('add').click();});
 $('dialogBg').onclick=e=>{if(e.target===$('dialogBg'))closeDialog();};
