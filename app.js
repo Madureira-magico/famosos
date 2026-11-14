@@ -66,25 +66,140 @@ async function fillPortrait(el){const name=el.dataset.person,p=people.find(x=>x.
 async function wikiPortrait(name){for(const domain of ['pt.wikipedia.org','en.wikipedia.org']){try{const u=`https://${domain}/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(name)}&gsrlimit=5&prop=pageimages&pithumbsize=640&format=json&origin=*`;const r=await fetch(u);if(!r.ok)continue;const data=await r.json();const pages=Object.values(data.query?.pages||{}).sort((a,b)=>(a.index||99)-(b.index||99));const exact=pages.find(p=>norm(p.title)===norm(name)&&p.thumbnail);const choice=exact||pages.find(p=>p.thumbnail&&norm(p.title).includes(norm(name)));if(choice)return choice.thumbnail.source;}catch{}}return '';
 }
 async function findCandidates(name, skipAI=true){
-  const seen=new Set(),out=[];
-  const add=u=>{if(u&&typeof u==='string'&&u.startsWith('https:')&&!seen.has(u)){seen.add(u);out.push(u);}};
-  // Buscar novamente uma foto não deve gastar uma consulta no Gemini.
-  for(const u of photoOptions[canonical(name)]||[])add(u);
-  const preferred=await wikiPortrait(name);
-  add(preferred);
-  try{
-    const endpoint=new URL('https://commons.wikimedia.org/w/api.php');
-    endpoint.search=new URLSearchParams({action:'query',generator:'search',gsrsearch:`filetype:bitmap ${name} portrait`,gsrnamespace:'6',gsrlimit:'25',prop:'imageinfo',iiprop:'url|mime',iiurlwidth:'900',format:'json',origin:'*'}).toString();
-    const resp=await fetch(endpoint.toString());
-    if(resp.ok){
-      const d=await resp.json();
-      const pages=Object.values(d.query?.pages||{}).sort((a,b)=>(a.index||100)-(b.index||100));
-      for(const p of pages){const info=p.imageinfo?.[0];if(info?.mime?.startsWith('image/')&&!info.mime.includes('svg'))add(info.thumburl||info.url);}
-    }
-  }catch(e){console.warn('Pesquisa Commons indisponível:',e);}
-  cacheOptions(name,out);
-  return out;
+ const out=[],seen=new Set();
+ const add=u=>{if(u&&typeof u==='string'&&u.startsWith('https:')&&!seen.has(u)){seen.add(u);out.push(u);}};
+ try{const selected=people.find(p=>p.name===name);if(selected?.url&&!selected.url.startsWith('local:'))add(selected.url);}catch{}
+ const ranked=await commonsHeadshots(name);
+ const wiki=await wikiPortrait(name);
+ if(wiki)add(wiki);
+ for(const pic of ranked)add(pic.url);
+ // Do not reuse older unfiltered photos when curated results are available.
+ if(!out.length)for(const u of photoOptions[canonical(name)]||[])add(u);
+ cacheOptions(name,out);return out;
 }
+// Revisa fotos buscando retratos reais e preserva a lista existente.
+// Sem reconhecimento facial, as sugestões não são verificações de identidade.
+const BLOCKED_IMAGE=/madonna and child|virgin mary|madonna with child|mother of god|virgin and child|painting|portrait of a lady|oil on canvas|altarpiece|religious|icon of|sculpture|statue|mural|drawing|illustration|caricature|comic|logo|poster|album cover|cover art|collage|group photo|group portrait|wax figure|cosplay|artwork|depiction|fan art|film poster|movie poster|ai.generated|generated image/i;
+const QUALIFIERS={
+ 'madonna':'Madonna singer musician American',
+ 'will smith':'Will Smith actor American',
+ 'the rock':'Dwayne Johnson actor',
+ 'dwayne johnson':'Dwayne Johnson actor',
+ 'roberto carlos':'Roberto Carlos singer Brazil',
+ 'leonardo':'Leonardo sertanejo singer Brazil',
+ 'daniel':'Daniel singer Brazil',
+ 'jorge':'Jorge singer sertanejo Brazil',
+ 'mateus':'Mateus singer sertanejo Brazil',
+ 'luciano':'Luciano singer sertanejo Brazil',
+ 'cristiano':'Cristiano sertanejo singer Brazil',
+ 'henrique':'Henrique sertanejo singer Brazil',
+ 'juliano':'Juliano sertanejo singer Brazil',
+ 'ze neto':'Zé Neto sertanejo Brazil',
+ 'anitta':'Anitta singer Brazil',
+ 'iza':'IZA singer Brazil',
+ 'al oc':'Alok DJ Brazil',
+ 'al ok':'Alok DJ Brazil',
+ 'al ok dj':'Alok DJ Brazil',
+ 's i a':'Sia singer Australia',
+ 'sia':'Sia singer Australia',
+ 'sting':'Sting musician singer',
+ 'bono':'Bono U2 singer',
+ 'prince':'Prince singer musician',
+ 'usher':'Usher singer',
+ 'adele':'Adele singer British',
+ 'zendaya':'Zendaya actress',
+ 'selena gomez':'Selena Gomez singer actress',
+ 'michael jackson':'Michael Jackson singer',
+ 'maria bethania':'Maria Bethânia singer Brazil',
+ 'fernanda torres':'Fernanda Torres actress Brazil',
+ 'fernanda montenegro':'Fernanda Montenegro actress Brazil'
+};
+function searchIdentity(name){return QUALIFIERS[norm(name)]||name;}
+const normalizeWords=t=>new Set(norm(t).split(' ').filter(x=>x.length>2));
+function scoreCandidate(title,person){
+ const text=String(title||'').replace(/^File:/i,'');
+ if(BLOCKED_IMAGE.test(text))return -1000;
+ const n=norm(text), personWords=[...normalizeWords(person)];
+ if(!personWords.some(w=>n.includes(w)))return -1000;
+ const matched=personWords.filter(w=>n.includes(w)).length;
+ const isCommon=personWords.length===1;
+ let score=matched*8;
+ if(isCommon && !/singer|actress|actor|musician|portrait|headshot|photo|performer|vocalist|dj|celebrity/i.test(text)) score-=20;
+ if(/headshot|close.up|face|portrait|bust|profile photo/i.test(text)) score+=25;
+ if(/actor|actress|singer|musician|vocalist|performer/i.test(text))score+=8;
+ if(/cropped|crop|studio|press|official/i.test(text))score+=4;
+ if(/concert|stage|red.carpet|award/i.test(text))score-=3;
+ if(/band|duo|together|cast|with |and /i.test(text))score-=20;
+ return score;
+}
+async function commonsHeadshots(name){
+ const qualified=searchIdentity(name), queries=[qualified+' portrait',qualified+' headshot',qualified+' close up'];
+ let found=[];const used=new Set();
+ for(const q of queries){
+   const endpoint=new URL('https://commons.wikimedia.org/w/api.php');
+   endpoint.search=new URLSearchParams({action:'query',format:'json',generator:'search',gsrsearch:'filetype:bitmap '+q,gsrnamespace:'6',gsrlimit:'30',prop:'imageinfo',iiprop:'url|mime|size',iiurlwidth:'850',origin:'*'}).toString();
+   try{
+     const r=await fetch(endpoint.toString(),{signal:AbortSignal.timeout(18000)});
+     if(!r.ok)continue;const d=await r.json();
+     for(const page of Object.values(d.query?.pages||{})){
+       const meta=page.imageinfo?.[0]; if(!meta||!meta.mime?.startsWith('image/')||meta.mime.includes('svg'))continue;
+       const u=meta.thumburl||meta.url;
+       if(!u||used.has(u))continue;used.add(u);
+       if(meta.width && meta.height && (meta.width<320||meta.height<320))continue;
+       const score=scoreCandidate(page.title,name);
+       if(score<=0)continue;
+       found.push({url:u,score,title:page.title});
+     }
+   }catch{}
+   if(found.some(x=>x.score>=33))break;
+ }
+ found.sort((a,b)=>b.score-a.score);
+ return found;
+}
+async function bestPortrait(name){
+ // For one-word names, prefer verified Wikipedia profile when Commons is ambiguous.
+ const listed=await commonsHeadshots(name);
+ if(listed.length && listed[0].score>=30)return listed[0].url;
+ const wiki=await wikiPortrait(name);
+ if(wiki)return wiki;
+ return listed.length && listed[0].score>=15?listed[0].url:'';
+}
+let batchRunning=false, batchCancelled=false;
+function sleep(ms){return new Promise(ok=>setTimeout(ok,ms));}
+async function refreshEntireList(){
+ if(batchRunning||exportBusy)return;
+ const overwrite=confirm('Vamos procurar retratos para todos os nomes. Fotos escolhidas manualmente serão preservadas. Deseja também substituir suas fotos escolhidas manualmente?\n\nOK: substituir todas as fotos.\nCancelar: preservar fotos manuais e continuar.');
+ if(!confirm('Antes de começar, recomendamos usar Cópia da lista para guardar seus nomes. Iniciar a revisão de '+people.length+' famosos agora?'))return;
+ batchRunning=true;batchCancelled=false;
+ $('refreshAll').disabled=true;
+ const group=[...people];let updated=0,skipped=0,failed=0;
+ $('progCancel').textContent='Cancelar revisão';
+ for(let i=0;i<group.length;i++){
+   if(batchCancelled)break;
+   const p=group[i];
+   progress('Revisando fotos da lista',100*i/group.length,`${i+1} de ${group.length}, ${p.name}. Atualizadas: ${updated}`);
+   if(p.locked&&!overwrite){skipped++;continue;}
+   try{
+     const url=await bestPortrait(p.name);
+     if(!url){failed++;continue;}
+     // Store each image before overwriting a previous saved choice.
+     let blob=null;
+     try{const r=await fetch(url,{mode:'cors',signal:AbortSignal.timeout(16000)});if(r.ok){const b=await r.blob();if(b.type.startsWith('image/')&&b.size>3000)blob=b;}}catch{}
+     if(!blob){failed++;continue;}
+     const current=people.find(x=>x.name===p.name);
+     if(!current){skipped++;continue;}
+     await dbPut(p.name,blob);
+     current.url=url;current.source='Retrato pesquisado';current.locked=false;
+     clearObjUrl(p.name);updated++;persist();
+   }catch(e){failed++;}
+   if(i%5===0)await sleep(100);
+ }
+ batchRunning=false;$('refreshAll').disabled=false;
+ endProgress();
+ $('progCancel').textContent='Cancelar';
+ render();announce(`${batchCancelled?'Revisão interrompida.':'Revisão concluída.'} ${updated} fotos atualizadas, ${skipped} preservadas, ${failed} não encontradas. Fotos sem resultado foram mantidas.`);
+}
+$('refreshAll').onclick=refreshEntireList;
 function dlgInfo(text){$('dlgStatus').textContent=text;}
 function displaySelection(){const img=candidates[photoIndex];$('dlgPreview').replaceChildren();if(img){const el=document.createElement('img');el.src=img;el.alt=selection?.name||'Foto';el.onerror=()=>dlgInfo('Esta imagem não abriu. Toque em Outra foto.');$('dlgPreview').append(el);dlgInfo(`Foto ${photoIndex+1} de ${candidates.length}. Você pode escolher outra.`);}else{$('dlgPreview').textContent='Sem foto';dlgInfo('Não encontramos fotos automaticamente. Você pode escolher uma imagem do aparelho.');}$('prevPhoto').disabled=photoIndex<=0;$('nextPhoto').disabled=photoIndex>=candidates.length-1;$('dlgSave').disabled=!img&&!currentUpload;}
 async function editPhoto(p,prefetched=[]){selection=p;currentUpload=null;candidates=[];photoIndex=0;$('dlgName').textContent=p.name;$('dialogBg').classList.add('open');$('dlgPreview').textContent='Pesquisando...';dlgInfo('Buscando fotos na Wikipédia e no Wikimedia Commons...');$('dlgSave').disabled=true;$('photoUpload').value='';try{const found=prefetched.length?prefetched:await findCandidates(p.name);if(selection!==p)return;candidates=found;cacheOptions(p.name,candidates);if(p.url&&!p.url.startsWith('local:')){const i=candidates.indexOf(p.url);if(i>=0)photoIndex=i;else{candidates.unshift(p.url);photoIndex=0;}}displaySelection();}catch{displaySelection();}}
@@ -142,7 +257,7 @@ $('add').onclick=async()=>{
 };
 $('search').addEventListener('keydown',e=>{if(e.key==='Enter')$('add').click();});
 $('dialogBg').onclick=e=>{if(e.target===$('dialogBg'))closeDialog();};
-$('progCancel').onclick=()=>{abortExport=true;};
+$('progCancel').onclick=()=>{abortExport=true;batchCancelled=true;};
 function progress(label,percent,detail){$('progress').classList.add('open');$('progLabel').textContent=label;$('progBar').value=percent;$('progDetails').textContent=detail;}
 function endProgress(){$('progress').classList.remove('open');exportBusy=false;abortExport=false;}
 function saveFile(blob,file){const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=file;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000);}

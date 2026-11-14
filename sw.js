@@ -1,4 +1,4 @@
-const CACHE='famosos-app-v4';
+const CACHE='famosos-app-v5';
 const SHELL=['./','./index.html','./names.js','./app.js','./jszip.min.js','./icon.png','./manifest.webmanifest'];
 self.addEventListener('install',ev=>ev.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',ev=>ev.waitUntil(Promise.all([caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith('famosos-app-')&&k!==CACHE).map(k=>caches.delete(k)))),self.clients.claim()])));
